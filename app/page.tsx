@@ -1,7 +1,68 @@
+"use client";
+
 import Link from "next/link";
 import { UserIcon, CalendarIcon, ClockIcon } from "@heroicons/react/24/outline";
+import { collection, getDocs, query, where, orderBy } from "firebase/firestore";
+import { db } from "../lib/firebase";
+import { useEffect, useState } from "react";
 
 export default function Home() {
+  const [employeeCount, setEmployeeCount] = useState(0);
+  const [scheduleCount, setScheduleCount] = useState(0);
+  const [upcomingShifts, setUpcomingShifts] = useState(0);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        // Fetch employee count
+        const employeesSnapshot = await getDocs(collection(db, "employees"));
+        setEmployeeCount(employeesSnapshot.size);
+
+        // Fetch schedule count
+        const schedulesSnapshot = await getDocs(collection(db, "schedules"));
+        setScheduleCount(schedulesSnapshot.size);
+
+        // Fetch upcoming shifts (shifts in the next 7 days)
+        const today = new Date();
+        const nextWeek = new Date();
+        nextWeek.setDate(today.getDate() + 7);
+
+        const schedulesQuery = query(
+          collection(db, "schedules"),
+          where("startDate", "<=", nextWeek.toISOString()),
+          where("endDate", ">=", today.toISOString())
+        );
+
+        const upcomingSchedules = await getDocs(schedulesQuery);
+        let totalUpcomingShifts = 0;
+
+        upcomingSchedules.forEach((doc) => {
+          const schedule = doc.data();
+          const shifts = schedule.shifts || [];
+          totalUpcomingShifts += shifts.length;
+        });
+
+        setUpcomingShifts(totalUpcomingShifts);
+      } catch (error) {
+        console.error("Error fetching data:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="text-center py-10">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-[var(--accent-primary)] mx-auto"></div>
+        <p className="mt-2 text-[var(--muted-text)]">Loading dashboard...</p>
+      </div>
+    );
+  }
+
   return (
     <div>
       <h1 className="text-2xl md:text-3xl font-bold mb-6">
@@ -17,7 +78,7 @@ export default function Home() {
             </div>
             <div className="ml-4">
               <h2 className="text-lg font-semibold">Employees</h2>
-              <p className="text-2xl font-bold">0</p>
+              <p className="text-2xl font-bold">{employeeCount}</p>
             </div>
           </div>
           <Link
@@ -35,7 +96,7 @@ export default function Home() {
             </div>
             <div className="ml-4">
               <h2 className="text-lg font-semibold">Schedules</h2>
-              <p className="text-2xl font-bold">0</p>
+              <p className="text-2xl font-bold">{scheduleCount}</p>
             </div>
           </div>
           <Link
@@ -53,7 +114,7 @@ export default function Home() {
             </div>
             <div className="ml-4">
               <h2 className="text-lg font-semibold">Upcoming Shifts</h2>
-              <p className="text-2xl font-bold">0</p>
+              <p className="text-2xl font-bold">{upcomingShifts}</p>
             </div>
           </div>
           <Link

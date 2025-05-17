@@ -143,10 +143,10 @@ export default function ScheduleForm() {
       // Get shift names based on selected shift type
       const shiftNames = getShiftNames(data.shiftType);
 
-      // Create a map to track hours assigned to each employee
-      const employeeHours: Record<string, number> = {};
+      // Create a map to track hours assigned to each employee per week
+      const employeeWeeklyHours: Record<string, number> = {};
       selectedEmployees.forEach((emp) => {
-        employeeHours[emp.id] = 0;
+        employeeWeeklyHours[emp.id] = 0;
       });
 
       // Create shifts for each date in the range
@@ -154,13 +154,27 @@ export default function ScheduleForm() {
 
       // Generate shifts for each date
       for (const date of dateRange) {
+        // Calculate the week number for this date
+        const currentDate = new Date(date);
+        const weekStart = new Date(currentDate);
+        weekStart.setDate(currentDate.getDate() - currentDate.getDay()); // Start of week (Sunday)
+        const weekKey = weekStart.toISOString().split('T')[0];
+
         // For each shift type on this date
         for (const shiftName of shiftNames) {
           // Create shift for available employees
           // Sort employees by hours assigned (ascending) to ensure even distribution
           const availableEmployees = selectedEmployees
-            .filter((emp) => !hasRequestedDayOff(emp, date))
-            .sort((a, b) => employeeHours[a.id] - employeeHours[b.id]);
+            .filter((emp) => {
+              // Check if employee has requested this day off
+              if (hasRequestedDayOff(emp, date)) return false;
+              
+              // Check if employee has reached 40 hours this week
+              const hoursThisWeek = employeeWeeklyHours[emp.id] || 0;
+              const shiftHours = data.shiftType === "8hour" ? 8 : 12;
+              return hoursThisWeek + shiftHours <= 40;
+            })
+            .sort((a, b) => (employeeWeeklyHours[a.id] || 0) - (employeeWeeklyHours[b.id] || 0));
 
           if (availableEmployees.length === 0) continue;
 
@@ -187,7 +201,7 @@ export default function ScheduleForm() {
 
           // Sort other employees by hours to ensure even distribution
           otherEmployees.sort(
-            (a, b) => employeeHours[a.id] - employeeHours[b.id]
+            (a, b) => (employeeWeeklyHours[a.id] || 0) - (employeeWeeklyHours[b.id] || 0)
           );
 
           // Combine prioritized and other employees
@@ -217,11 +231,17 @@ export default function ScheduleForm() {
               isPointPerson: emp.id === employeesToAssign[0].id,
             });
 
-            // Track hours worked
+            // Track hours worked for the week
             const hoursWorked = data.shiftType === "8hour" ? 8 : 12;
-            employeeHours[emp.id] += hoursWorked;
+            employeeWeeklyHours[emp.id] = (employeeWeeklyHours[emp.id] || 0) + hoursWorked;
           });
         }
+      }
+
+      // Check if we have enough employees to cover all shifts
+      const totalShiftsNeeded = dateRange.length * shiftNames.length;
+      if (shifts.length < totalShiftsNeeded) {
+        alert("Warning: Not enough employees available to cover all shifts while respecting the 40-hour work week limit. Some shifts may be understaffed.");
       }
 
       // Save the schedule to Firestore

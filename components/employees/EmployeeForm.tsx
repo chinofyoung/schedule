@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { useRouter } from "next/navigation";
 import { db } from "../../lib/firebase";
-import { collection, addDoc } from "firebase/firestore";
+import { collection, addDoc, doc, updateDoc } from "firebase/firestore";
 import { Employee, EmployeePosition } from "../../types/employee";
 import Link from "next/link";
 
@@ -62,9 +62,15 @@ export default function EmployeeForm({
 
     try {
       if (isEditing && employee) {
-        // TODO: Implement update functionality
-        alert("Update functionality will be implemented later");
+        // Update existing employee
+        const employeeRef = doc(db, "employees", employee.id);
+        await updateDoc(employeeRef, {
+          ...data,
+          // Preserve the requestedDaysOff array
+          requestedDaysOff: employee.requestedDaysOff || [],
+        });
       } else {
+        // Create new employee
         await addDoc(collection(db, "employees"), {
           ...data,
           requestedDaysOff: [],
