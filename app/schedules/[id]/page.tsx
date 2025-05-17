@@ -22,6 +22,7 @@ interface Schedule {
   shiftType: "8hour" | "12hour";
   shifts: ScheduleShift[];
   createdAt: string;
+  scheduleDayOffRequests?: Record<string, string[]>;
 }
 
 export default function ScheduleDetails() {
@@ -32,6 +33,20 @@ export default function ScheduleDetails() {
   const [schedule, setSchedule] = useState<Schedule | null>(null);
   const [employees, setEmployees] = useState<Record<string, Employee>>({});
   const [loading, setLoading] = useState(true);
+
+  // Calculate total hours for an employee
+  const calculateEmployeeHours = (employeeId: string): number => {
+    if (!schedule) return 0;
+    const employeeShifts = schedule.shifts.filter(shift => shift.employeeId === employeeId);
+    const hoursPerShift = schedule.shiftType === "8hour" ? 8 : 12;
+    return employeeShifts.length * hoursPerShift;
+  };
+
+  // Get day off requests for an employee
+  const getEmployeeDayOffRequests = (employeeId: string): string[] => {
+    if (!schedule?.scheduleDayOffRequests) return [];
+    return schedule.scheduleDayOffRequests[employeeId] || [];
+  };
 
   // Fetch schedule and related employees
   useEffect(() => {
@@ -242,6 +257,68 @@ export default function ScheduleDetails() {
               </div>
             </div>
           ))}
+        </div>
+      </div>
+
+      {/* Employee Summary Section */}
+      <div className="mt-8">
+        <h2 className="text-xl font-semibold mb-4 text-[var(--foreground)]">
+          Employee Summary
+        </h2>
+        <div className="bg-[var(--card-bg)] rounded-lg border border-[var(--card-border)] p-4">
+          <div className="space-y-4">
+            {Object.entries(employees).map(([employeeId, employee]) => {
+              const totalHours = calculateEmployeeHours(employeeId);
+              const dayOffRequests = getEmployeeDayOffRequests(employeeId);
+
+              return (
+                <div
+                  key={employeeId}
+                  className="p-4 bg-[var(--highlight-bg)] rounded-md"
+                >
+                  <div className="flex justify-between items-start mb-2">
+                    <div>
+                      <h3 className="font-medium text-[var(--foreground)]">
+                        {employee.firstName} {employee.lastName}
+                      </h3>
+                      <p className="text-sm text-[var(--muted-text)]">
+                        {employee.position}
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="font-medium text-[var(--foreground)]">
+                        {totalHours} hours
+                      </p>
+                      <p className="text-sm text-[var(--muted-text)]">
+                        {schedule.shiftType === "8hour" ? "8-hour shifts" : "12-hour shifts"}
+                      </p>
+                    </div>
+                  </div>
+                  {dayOffRequests.length > 0 && (
+                    <div className="mt-2">
+                      <p className="text-sm font-medium text-[var(--foreground)] mb-1">
+                        Day Off Requests:
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {dayOffRequests.map(date => (
+                          <div
+                            key={date}
+                            className="px-2 py-1 bg-[var(--card-bg)] rounded-md text-sm text-[var(--foreground)]"
+                          >
+                            {new Date(date).toLocaleDateString('en-US', {
+                              weekday: 'short',
+                              month: 'short',
+                              day: 'numeric'
+                            })}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
     </div>

@@ -7,6 +7,7 @@ import { db } from "../../lib/firebase";
 import { collection, getDocs, addDoc } from "firebase/firestore";
 import { Employee, ShiftType, ScheduleShift } from "../../types/employee";
 import Link from "next/link";
+import { CalendarIcon, XMarkIcon } from "@heroicons/react/24/outline";
 
 // Define the form data structure
 type FormData = {
@@ -15,6 +16,7 @@ type FormData = {
   endDate: string;
   shiftType: ShiftType;
   employees: string[]; // Array of selected employee IDs
+  scheduleDayOffRequests: Record<string, string[]>; // Map of employee ID to array of dates
 };
 
 export default function ScheduleForm() {
@@ -22,11 +24,14 @@ export default function ScheduleForm() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [loading, setLoading] = useState(true);
+  const [selectedEmployeeForDayOff, setSelectedEmployeeForDayOff] = useState<Employee | null>(null);
+  const [selectedDate, setSelectedDate] = useState("");
 
   const {
     register,
     handleSubmit,
     watch,
+    setValue,
     formState: { errors },
   } = useForm<FormData>({
     defaultValues: {
@@ -35,11 +40,57 @@ export default function ScheduleForm() {
       endDate: "",
       shiftType: "8hour",
       employees: [],
+      scheduleDayOffRequests: {},
     },
   });
 
-  // Watch the selected shift type to show appropriate shift options
+  // Watch form values
   const selectedShiftType = watch("shiftType");
+  const startDate = watch("startDate");
+  const endDate = watch("endDate");
+  const scheduleDayOffRequests = watch("scheduleDayOffRequests");
+
+  // Generate date range for the date picker
+  const generateDateRange = (start: string, end: string): string[] => {
+    if (!start || !end) return [];
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+    const dateArray = [];
+    let currentDate = new Date(startDate);
+
+    while (currentDate <= endDate) {
+      dateArray.push(currentDate.toISOString().split("T")[0]);
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+
+    return dateArray;
+  };
+
+  // Add day off request
+  const addDayOffRequest = () => {
+    if (!selectedEmployeeForDayOff || !selectedDate) return;
+
+    const currentRequests = scheduleDayOffRequests[selectedEmployeeForDayOff.id] || [];
+    if (!currentRequests.includes(selectedDate)) {
+      setValue("scheduleDayOffRequests", {
+        ...scheduleDayOffRequests,
+        [selectedEmployeeForDayOff.id]: [...currentRequests, selectedDate],
+      });
+    }
+
+    setSelectedEmployeeForDayOff(null);
+    setSelectedDate("");
+  };
+
+  // Remove day off request
+  const removeDayOffRequest = (employeeId: string, date: string) => {
+    const currentRequests = scheduleDayOffRequests[employeeId] || [];
+    setValue("scheduleDayOffRequests", {
+      ...scheduleDayOffRequests,
+      [employeeId]: currentRequests.filter(d => d !== date),
+    });
+  };
+
   // Fetch employees from Firestore
   useEffect(() => {
     const fetchEmployees = async () => {
@@ -70,29 +121,6 @@ export default function ScheduleForm() {
 
     fetchEmployees();
   }, []);
-  // Helper function to generate dates between start and end dates
-  const generateDateRange = (startDate: string, endDate: string): string[] => {
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    const dateArray = [];
-
-    // Create a new date object to avoid modifying the original
-    let currentDate = new Date(start);
-
-    // Loop from start date to end date
-    while (currentDate <= end) {
-      dateArray.push(currentDate.toISOString().split("T")[0]);
-      // Add one day
-      currentDate.setDate(currentDate.getDate() + 1);
-    }
-
-    return dateArray;
-  };
-
-  // Helper function to check if an employee has requested a day off
-  const hasRequestedDayOff = (employee: Employee, date: string): boolean => {
-    return (employee.requestedDaysOff || []).includes(date);
-  };
 
   // Helper to check if an employee is a senior nurse (Nurse 3 or Nurse 4)
   const isSeniorNurse = (employee: Employee): boolean => {
@@ -151,6 +179,7 @@ export default function ScheduleForm() {
 
       // Create shifts for each date in the range
       const shifts: ScheduleShift[] = [];
+      let dayOffConflicts = 0;
 
       // Generate shifts for each date
       for (const date of dateRange) {
@@ -167,7 +196,11 @@ export default function ScheduleForm() {
           const availableEmployees = selectedEmployees
             .filter((emp) => {
               // Check if employee has requested this day off
-              if (hasRequestedDayOff(emp, date)) return false;
+              const scheduleDayOffs = data.scheduleDayOffRequests[emp.id] || [];
+              if (scheduleDayOffs.includes(date)) {
+                dayOffConflicts++;
+                return false;
+              }
               
               // Check if employee has reached 40 hours this week
               const hoursThisWeek = employeeWeeklyHours[emp.id] || 0;
@@ -240,8 +273,18 @@ export default function ScheduleForm() {
 
       // Check if we have enough employees to cover all shifts
       const totalShiftsNeeded = dateRange.length * shiftNames.length;
+      let warningMessage = "";
+
       if (shifts.length < totalShiftsNeeded) {
-        alert("Warning: Not enough employees available to cover all shifts while respecting the 40-hour work week limit. Some shifts may be understaffed.");
+        warningMessage += "Warning: Not enough employees available to cover all shifts while respecting the 40-hour work week limit. Some shifts may be understaffed.\n\n";
+      }
+
+      if (dayOffConflicts > 0) {
+        warningMessage += `Note: ${dayOffConflicts} day off requests could not be accommodated due to staffing requirements.`;
+      }
+
+      if (warningMessage) {
+        alert(warningMessage);
       }
 
       // Save the schedule to Firestore
@@ -251,6 +294,7 @@ export default function ScheduleForm() {
         endDate: data.endDate,
         shiftType: data.shiftType,
         shifts: shifts,
+        scheduleDayOffRequests: data.scheduleDayOffRequests,
         createdAt: new Date().toISOString(),
       };
 
@@ -268,6 +312,7 @@ export default function ScheduleForm() {
       setIsSubmitting(false);
     }
   };
+
   if (loading) {
     return <div className="text-center py-4">Loading employees...</div>;
   }
@@ -287,6 +332,8 @@ export default function ScheduleForm() {
       </div>
     );
   }
+
+  const availableDates = generateDateRange(startDate, endDate);
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
@@ -314,7 +361,8 @@ export default function ScheduleForm() {
               {errors.name.message}
             </p>
           )}
-        </div>{" "}
+        </div>
+
         <div>
           <label
             htmlFor="startDate"
@@ -338,6 +386,7 @@ export default function ScheduleForm() {
             </p>
           )}
         </div>
+
         <div>
           <label
             htmlFor="endDate"
@@ -360,7 +409,8 @@ export default function ScheduleForm() {
               {errors.endDate.message}
             </p>
           )}
-        </div>{" "}
+        </div>
+
         <div className="md:col-span-2">
           <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
             Shift Type*
@@ -398,7 +448,8 @@ export default function ScheduleForm() {
               {errors.shiftType.message}
             </p>
           )}
-        </div>{" "}
+        </div>
+
         <div className="md:col-span-2">
           <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
             Select Employees*
@@ -511,7 +562,121 @@ export default function ScheduleForm() {
             </p>
           )}
         </div>
-      </div>{" "}
+
+        {/* Schedule Day Off Requests Section */}
+        <div className="md:col-span-2">
+          <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
+            Schedule Day Off Requests
+          </label>
+          <div className="border border-[var(--card-border)] bg-[var(--highlight-bg)] rounded-md p-4">
+            {/* Add Day Off Request Form */}
+            <div className="mb-4 p-4 bg-[var(--card-bg)] rounded-md">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-[var(--foreground)] mb-1">
+                    Select Employee
+                  </label>
+                  <select
+                    value={selectedEmployeeForDayOff?.id || ""}
+                    onChange={(e) => {
+                      const employee = employees.find(emp => emp.id === e.target.value);
+                      setSelectedEmployeeForDayOff(employee || null);
+                    }}
+                    className="w-full px-3 py-2 bg-[var(--highlight-bg)] border border-[var(--card-border)] rounded-md text-[var(--foreground)]"
+                  >
+                    <option value="">Select an employee</option>
+                    {employees
+                      .filter(emp => watch("employees").includes(emp.id))
+                      .map(emp => (
+                        <option key={emp.id} value={emp.id}>
+                          {emp.firstName} {emp.lastName}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-[var(--foreground)] mb-1">
+                    Select Date
+                  </label>
+                  <select
+                    value={selectedDate}
+                    onChange={(e) => setSelectedDate(e.target.value)}
+                    className="w-full px-3 py-2 bg-[var(--highlight-bg)] border border-[var(--card-border)] rounded-md text-[var(--foreground)]"
+                  >
+                    <option value="">Select a date</option>
+                    {availableDates.map(date => (
+                      <option key={date} value={date}>
+                        {new Date(date).toLocaleDateString('en-US', {
+                          weekday: 'short',
+                          month: 'short',
+                          day: 'numeric'
+                        })}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-end">
+                  <button
+                    type="button"
+                    onClick={addDayOffRequest}
+                    disabled={!selectedEmployeeForDayOff || !selectedDate}
+                    className="w-full px-4 py-2 bg-[var(--accent-primary)] text-white rounded-md hover:bg-[color-mix(in_srgb,var(--accent-primary),black_10%)] disabled:opacity-50"
+                  >
+                    Add Day Off
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Display Day Off Requests */}
+            <div className="space-y-4">
+              {Object.entries(scheduleDayOffRequests).map(([employeeId, dates]) => {
+                const employee = employees.find(emp => emp.id === employeeId);
+                if (!employee) return null;
+
+                return (
+                  <div key={employeeId} className="p-3 bg-[var(--card-bg)] rounded-md">
+                    <div className="flex justify-between items-center mb-2">
+                      <h4 className="font-medium text-[var(--foreground)]">
+                        {employee.firstName} {employee.lastName}
+                      </h4>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {dates.map(date => (
+                        <div
+                          key={date}
+                          className="flex items-center gap-1 px-2 py-1 bg-[var(--highlight-bg)] rounded-md text-sm"
+                        >
+                          <span className="text-[var(--foreground)]">
+                            {new Date(date).toLocaleDateString('en-US', {
+                              weekday: 'short',
+                              month: 'short',
+                              day: 'numeric'
+                            })}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => removeDayOffRequest(employeeId, date)}
+                            className="text-[var(--accent-danger)] hover:text-[color-mix(in_srgb,var(--accent-danger),black_10%)]"
+                          >
+                            <XMarkIcon className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
+              {Object.keys(scheduleDayOffRequests).length === 0 && (
+                <p className="text-sm text-[var(--muted-text)] text-center py-4">
+                  No day off requests added yet. Select an employee and date above to add one.
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div className="flex justify-end space-x-3">
         <Link
           href="/schedules"
