@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { UserIcon, CalendarIcon, ClockIcon } from "@heroicons/react/24/outline";
-import { collection, getDocs, query, where, orderBy } from "firebase/firestore";
+import { collection, getDocs, query, where, orderBy, limit } from "firebase/firestore";
 import { db } from "../lib/firebase";
 import { useEffect, useState } from "react";
 
@@ -11,6 +11,7 @@ export default function Home() {
   const [scheduleCount, setScheduleCount] = useState(0);
   const [upcomingShifts, setUpcomingShifts] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [mostRecentSchedule, setMostRecentSchedule] = useState<{ id: string; name: string } | null>(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -20,21 +21,38 @@ export default function Home() {
         setEmployeeCount(employeesSnapshot.size);
 
         // Fetch schedule count
-        const schedulesSnapshot = await getDocs(collection(db, "schedules"));
-        setScheduleCount(schedulesSnapshot.size);
+        const allSchedulesSnapshot = await getDocs(collection(db, "schedules"));
+        setScheduleCount(allSchedulesSnapshot.size);
+
+        // Fetch most recent schedule
+        const recentSchedulesQuery = query(
+          collection(db, "schedules"),
+          orderBy("createdAt", "desc"),
+          limit(1)
+        );
+        const schedulesSnapshot = await getDocs(recentSchedulesQuery);
+
+        // Get most recent schedule
+        if (!schedulesSnapshot.empty) {
+          const recentSchedule = schedulesSnapshot.docs[0];
+          setMostRecentSchedule({
+            id: recentSchedule.id,
+            name: recentSchedule.data().name
+          });
+        }
 
         // Fetch upcoming shifts (shifts in the next 7 days)
         const today = new Date();
         const nextWeek = new Date();
         nextWeek.setDate(today.getDate() + 7);
 
-        const schedulesQuery = query(
+        const upcomingSchedulesQuery = query(
           collection(db, "schedules"),
           where("startDate", "<=", nextWeek.toISOString()),
           where("endDate", ">=", today.toISOString())
         );
 
-        const upcomingSchedules = await getDocs(schedulesQuery);
+        const upcomingSchedules = await getDocs(upcomingSchedulesQuery);
         let totalUpcomingShifts = 0;
 
         upcomingSchedules.forEach((doc) => {
@@ -117,12 +135,21 @@ export default function Home() {
               <p className="text-2xl font-bold">{upcomingShifts}</p>
             </div>
           </div>
-          <Link
-            href="/schedules"
-            className="block mt-4 text-[var(--accent-secondary)] text-sm hover:underline"
-          >
-            View shifts &rarr;
-          </Link>
+          {mostRecentSchedule ? (
+            <Link
+              href={`/schedules/${mostRecentSchedule.id}`}
+              className="block mt-4 text-[var(--accent-secondary)] text-sm hover:underline"
+            >
+              View {mostRecentSchedule.name} &rarr;
+            </Link>
+          ) : (
+            <Link
+              href="/schedules"
+              className="block mt-4 text-[var(--accent-secondary)] text-sm hover:underline"
+            >
+              View shifts &rarr;
+            </Link>
+          )}
         </div>
       </div>
 

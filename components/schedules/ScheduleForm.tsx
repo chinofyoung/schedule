@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { useRouter } from "next/navigation";
 import { db } from "../../lib/firebase";
-import { collection, getDocs, addDoc } from "firebase/firestore";
+import { collection, getDocs, addDoc, serverTimestamp } from "firebase/firestore";
 import { Employee, ShiftType, ScheduleShift } from "../../types/employee";
 import Link from "next/link";
 import { CalendarIcon, XMarkIcon } from "@heroicons/react/24/outline";
@@ -19,11 +19,29 @@ type FormData = {
   scheduleDayOffRequests: Record<string, string[]>; // Map of employee ID to array of dates
 };
 
+// Add LoadingProgress component
+const LoadingProgress = ({ progress, message }: { progress: number; message: string }) => (
+  <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+    <div className="bg-[var(--card-bg)] p-6 rounded-lg shadow-xl w-full max-w-md">
+      <div className="mb-4">
+        <div className="h-2 bg-[var(--highlight-bg)] rounded-full overflow-hidden">
+          <div 
+            className="h-full bg-[var(--accent-primary)] transition-all duration-300 ease-in-out"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+      </div>
+      <p className="text-center text-[var(--foreground)]">{message}</p>
+    </div>
+  </div>
+);
+
 export default function ScheduleForm() {
   const router = useRouter();
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [loadingProgress, setLoadingProgress] = useState(0);
+  const [loadingMessage, setLoadingMessage] = useState("");
   const [employees, setEmployees] = useState<Employee[]>([]);
-  const [loading, setLoading] = useState(true);
   const [selectedEmployeeForDayOff, setSelectedEmployeeForDayOff] = useState<Employee | null>(null);
   const [selectedDate, setSelectedDate] = useState("");
 
@@ -49,6 +67,7 @@ export default function ScheduleForm() {
   const startDate = watch("startDate");
   const endDate = watch("endDate");
   const scheduleDayOffRequests = watch("scheduleDayOffRequests");
+  const selectedEmployees = watch("employees");
 
   // Generate date range for the date picker
   const generateDateRange = (start: string, end: string): string[] => {
@@ -114,8 +133,6 @@ export default function ScheduleForm() {
         setEmployees(employeesList);
       } catch (error) {
         console.error("Error fetching employees:", error);
-      } finally {
-        setLoading(false);
       }
     };
 
@@ -146,176 +163,279 @@ export default function ScheduleForm() {
       : ["day", "night"];
   };
 
-  const onSubmit = async (data: FormData) => {
-    setIsSubmitting(true);
+  // Handle select all for a category
+  const handleSelectAll = (category: string) => {
+    const categoryEmployees = employees.filter(emp => {
+      if (category === "Nurse") return emp.position.startsWith("Nurse");
+      if (category === "Midwife") return emp.position.startsWith("Midwife");
+      if (category === "NA") return emp.position.startsWith("NA");
+      return false;
+    });
 
+    const categoryEmployeeIds = categoryEmployees.map(emp => emp.id);
+    const otherSelectedEmployees = selectedEmployees.filter(id => !categoryEmployeeIds.includes(id));
+
+    // If all category employees are already selected, deselect them
+    const allSelected = categoryEmployeeIds.every(id => selectedEmployees.includes(id));
+    
+    setValue("employees", allSelected ? otherSelectedEmployees : [...otherSelectedEmployees, ...categoryEmployeeIds]);
+  };
+
+  // Check if all employees in a category are selected
+  const areAllSelected = (category: string) => {
+    const categoryEmployees = employees.filter(emp => {
+      if (category === "Nurse") return emp.position.startsWith("Nurse");
+      if (category === "Midwife") return emp.position.startsWith("Midwife");
+      if (category === "NA") return emp.position.startsWith("NA");
+      return false;
+    });
+
+    return categoryEmployees.length > 0 && categoryEmployees.every(emp => selectedEmployees.includes(emp.id));
+  };
+
+  const onSubmit = async (data: FormData) => {
     try {
-      // Get the selected employees from the form data
+      setIsSubmitting(true);
+      setLoadingProgress(0);
+      setLoadingMessage("Fetching employees...");
+
+      // Fetch all employees
+      const employeesCollection = collection(db, "employees");
+      const employeesSnapshot = await getDocs(employeesCollection);
+      const employees = employeesSnapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      })) as Employee[];
+
+      setLoadingProgress(20);
+      setLoadingMessage("Preparing schedule data...");
+
+      // Filter selected employees
       const selectedEmployees = employees.filter((emp) =>
         data.employees.includes(emp.id)
       );
 
-      if (selectedEmployees.length === 0) {
-        alert("Please select at least one employee for the schedule.");
-        return;
-      }
+      // Generate dates for the schedule
+      const dates = generateDateRange(data.startDate, data.endDate);
+      const scheduleDuration = dates.length;
 
-      // Generate the range of dates for the schedule
-      const dateRange = generateDateRange(data.startDate, data.endDate);
+      setLoadingProgress(40);
+      setLoadingMessage("Calculating shift assignments...");
 
-      if (dateRange.length === 0) {
-        alert("Invalid date range. End date must be after start date.");
-        return;
-      }
+      // Calculate required shifts per employee to reach 80 hours
+      const hoursPerShift = data.shiftType === "8hour" ? 8 : 12;
+      const totalRequiredShifts = Math.ceil(80 / hoursPerShift);
 
-      // Get shift names based on selected shift type
-      const shiftNames = getShiftNames(data.shiftType);
-
-      // Create a map to track hours assigned to each employee per week
-      const employeeWeeklyHours: Record<string, number> = {};
+      // Initialize tracking
+      const employeeHours: Record<string, number> = {};
+      const employeeShifts: Record<string, ScheduleShift[]> = {};
+      const shiftsPerDay: Record<string, number> = {};
+      const shiftsPerDayShift: Record<string, number> = {};
+      
       selectedEmployees.forEach((emp) => {
-        employeeWeeklyHours[emp.id] = 0;
+        employeeHours[emp.id] = 0;
+        employeeShifts[emp.id] = [];
       });
 
-      // Create shifts for each date in the range
-      const shifts: ScheduleShift[] = [];
-      let dayOffConflicts = 0;
+      // Initialize shifts per day tracking
+      dates.forEach(date => {
+        shiftsPerDay[date] = 0;
+        getShiftNames(data.shiftType).forEach(shiftName => {
+          shiftsPerDayShift[`${date}-${shiftName}`] = 0;
+        });
+      });
 
-      // Generate shifts for each date
-      for (const date of dateRange) {
-        // Calculate the week number for this date
-        const currentDate = new Date(date);
-        const weekStart = new Date(currentDate);
-        weekStart.setDate(currentDate.getDate() - currentDate.getDay()); // Start of week (Sunday)
-        const weekKey = weekStart.toISOString().split('T')[0];
+      // Get shift names based on shift type
+      const shiftNames = getShiftNames(data.shiftType);
 
-        // For each shift type on this date
-        for (const shiftName of shiftNames) {
-          // Create shift for available employees
-          // Sort employees by hours assigned (ascending) to ensure even distribution
-          const availableEmployees = selectedEmployees
-            .filter((emp) => {
-              // Check if employee has requested this day off
-              const scheduleDayOffs = data.scheduleDayOffRequests[emp.id] || [];
-              if (scheduleDayOffs.includes(date)) {
-                dayOffConflicts++;
-                return false;
-              }
-              
-              // Check if employee has reached 40 hours this week
-              const hoursThisWeek = employeeWeeklyHours[emp.id] || 0;
-              const shiftHours = data.shiftType === "8hour" ? 8 : 12;
-              return hoursThisWeek + shiftHours <= 40;
-            })
-            .sort((a, b) => (employeeWeeklyHours[a.id] || 0) - (employeeWeeklyHours[b.id] || 0));
+      setLoadingProgress(60);
+      setLoadingMessage("Assigning shifts to employees...");
 
-          if (availableEmployees.length === 0) continue;
+      // Calculate target shifts per day and per shift
+      const totalShifts = selectedEmployees.length * totalRequiredShifts;
+      const targetShiftsPerDay = Math.ceil(totalShifts / dates.length);
+      const targetShiftsPerDayShift = Math.ceil(targetShiftsPerDay / shiftNames.length);
 
-          // Ensure we have a senior nurse if possible
-          const seniorNurses = availableEmployees.filter((emp) =>
-            isSeniorNurse(emp)
-          );
-          const midwives = availableEmployees.filter((emp) => isMidwife(emp));
-          const nursingAttendants = availableEmployees.filter((emp) =>
-            isNursingAttendant(emp)
-          );
+      // Create a matrix of all possible shifts (dates × shift names)
+      const allShifts = dates.flatMap(date => 
+        shiftNames.map(shiftName => ({ date, shiftName }))
+      );
 
-          // Prioritize employees by role
-          const prioritizedEmployees = [
-            ...(seniorNurses.length > 0 ? [seniorNurses[0]] : []), // Add senior nurse if available
-            ...(midwives.length > 0 ? [midwives[0]] : []), // Add midwife if available
-            ...(nursingAttendants.length > 0 ? [nursingAttendants[0]] : []), // Add NA if available
-          ];
+      // Sort shifts by current count to ensure even distribution
+      const sortedShifts = [...allShifts].sort((a, b) => {
+        const aCount = shiftsPerDayShift[`${a.date}-${a.shiftName}`];
+        const bCount = shiftsPerDayShift[`${b.date}-${b.shiftName}`];
+        return aCount - bCount;
+      });
 
-          // Add other available employees
-          const otherEmployees = availableEmployees.filter(
-            (emp) => !prioritizedEmployees.includes(emp)
-          );
+      // First pass: Distribute shifts evenly
+      for (const { date, shiftName } of sortedShifts) {
+        // Skip if this day/shift already has enough employees
+        if (shiftsPerDayShift[`${date}-${shiftName}`] >= targetShiftsPerDayShift) continue;
+        if (shiftsPerDay[date] >= targetShiftsPerDay) continue;
 
-          // Sort other employees by hours to ensure even distribution
-          otherEmployees.sort(
-            (a, b) => (employeeWeeklyHours[a.id] || 0) - (employeeWeeklyHours[b.id] || 0)
-          );
+        // Sort employees by hours worked and number of consecutive shifts
+        const availableEmployees = [...selectedEmployees]
+          .filter(emp => {
+            const hasDayOff = emp.requestedDaysOff?.includes(date);
+            if (hasDayOff) return false;
+            return employeeHours[emp.id] + hoursPerShift <= 80;
+          })
+          .sort((a, b) => {
+            // First sort by hours worked
+            const hoursDiff = employeeHours[a.id] - employeeHours[b.id];
+            if (hoursDiff !== 0) return hoursDiff;
 
-          // Combine prioritized and other employees
-          const assignedEmployees = [
-            ...prioritizedEmployees,
-            ...otherEmployees,
-          ];
-
-          // Limit to number of needed employees per shift
-          // For 8-hour shifts, we'll assign 3-4 employees
-          // For 12-hour shifts, we'll assign 4-5 employees
-          const employeesPerShift = data.shiftType === "8hour" ? 3 : 4;
-          const employeesToAssign = assignedEmployees.slice(
-            0,
-            employeesPerShift
-          );
-
-          // Assign employees to shift
-          employeesToAssign.forEach((emp) => {
-            // Add shift
-            shifts.push({
-              date,
-              shiftType: data.shiftType,
-              shiftName,
-              employeeId: emp.id,
-              // First employee in each shift (ideally senior nurse) is point person
-              isPointPerson: emp.id === employeesToAssign[0].id,
-            });
-
-            // Track hours worked for the week
-            const hoursWorked = data.shiftType === "8hour" ? 8 : 12;
-            employeeWeeklyHours[emp.id] = (employeeWeeklyHours[emp.id] || 0) + hoursWorked;
+            // Then sort by number of consecutive shifts
+            const aConsecutive = getConsecutiveShifts(employeeShifts[a.id], date);
+            const bConsecutive = getConsecutiveShifts(employeeShifts[b.id], date);
+            return aConsecutive - bConsecutive;
           });
+
+        // Calculate how many more employees we need for this shift
+        const currentShiftCount = shiftsPerDayShift[`${date}-${shiftName}`];
+        const remainingSlots = targetShiftsPerDayShift - currentShiftCount;
+        const employeesToAssign = Math.min(remainingSlots, availableEmployees.length);
+
+        // Assign employees to this shift
+        for (let i = 0; i < employeesToAssign; i++) {
+          const employee = availableEmployees[i];
+          if (!employee) continue;
+
+          const shift: ScheduleShift = {
+            date,
+            shiftType: data.shiftType,
+            shiftName,
+            employeeId: employee.id,
+            isPointPerson: i === 0 && currentShiftCount === 0, // First employee of first assignment is point person
+          };
+
+          employeeShifts[employee.id].push(shift);
+          employeeHours[employee.id] += hoursPerShift;
+          shiftsPerDay[date]++;
+          shiftsPerDayShift[`${date}-${shiftName}`]++;
         }
       }
 
-      // Check if we have enough employees to cover all shifts
-      const totalShiftsNeeded = dateRange.length * shiftNames.length;
-      let warningMessage = "";
+      setLoadingProgress(80);
+      setLoadingMessage("Finalizing schedule...");
 
-      if (shifts.length < totalShiftsNeeded) {
-        warningMessage += "Warning: Not enough employees available to cover all shifts while respecting the 40-hour work week limit. Some shifts may be understaffed.\n\n";
+      // Second pass: Fill remaining shifts to reach 80 hours
+      for (const employee of selectedEmployees) {
+        while (employeeHours[employee.id] < 80) {
+          // Find available shifts that maintain even distribution
+          const availableShift = sortedShifts.find(({ date, shiftName }) => {
+            const hasDayOff = employee.requestedDaysOff?.includes(date);
+            if (hasDayOff) return false;
+
+            const existingShift = employeeShifts[employee.id].find(
+              (s) => s.date === date && s.shiftName === shiftName
+            );
+            if (existingShift) return false;
+
+            // Check if this would create too many consecutive shifts
+            const consecutiveShifts = getConsecutiveShifts(employeeShifts[employee.id], date);
+            if (consecutiveShifts >= 3) return false;
+
+            // Check if this would exceed target shifts per day/shift
+            if (shiftsPerDayShift[`${date}-${shiftName}`] >= targetShiftsPerDayShift) return false;
+            if (shiftsPerDay[date] >= targetShiftsPerDay) return false;
+
+            return true;
+          });
+
+          if (!availableShift) break; // No more available shifts
+
+          const shift: ScheduleShift = {
+            date: availableShift.date,
+            shiftType: data.shiftType,
+            shiftName: availableShift.shiftName,
+            employeeId: employee.id,
+            isPointPerson: false,
+          };
+
+          employeeShifts[employee.id].push(shift);
+          employeeHours[employee.id] += hoursPerShift;
+          shiftsPerDay[availableShift.date]++;
+          shiftsPerDayShift[`${availableShift.date}-${availableShift.shiftName}`]++;
+        }
       }
 
-      if (dayOffConflicts > 0) {
-        warningMessage += `Note: ${dayOffConflicts} day off requests could not be accommodated due to staffing requirements.`;
-      }
+      // Flatten all shifts into a single array
+      const shifts = Object.values(employeeShifts).flat();
 
-      if (warningMessage) {
+      // Check if any employee didn't reach 80 hours
+      const understaffedEmployees = selectedEmployees.filter(
+        (emp) => employeeHours[emp.id] < 80
+      );
+
+      if (understaffedEmployees.length > 0) {
+        const warningMessage = `Warning: The following employees will not reach 80 hours:\n${understaffedEmployees
+          .map(
+            (emp) =>
+              `${emp.firstName} ${emp.lastName} (${employeeHours[emp.id]} hours)`
+          )
+          .join("\n")}`;
         alert(warningMessage);
       }
 
-      // Save the schedule to Firestore
-      const schedule = {
+      setLoadingProgress(90);
+      setLoadingMessage("Saving schedule to database...");
+
+      // Create the schedule document
+      const scheduleData = {
         name: data.name,
         startDate: data.startDate,
         endDate: data.endDate,
         shiftType: data.shiftType,
-        shifts: shifts,
+        shifts,
         scheduleDayOffRequests: data.scheduleDayOffRequests,
-        createdAt: new Date().toISOString(),
+        createdAt: serverTimestamp(),
       };
 
-      // Save to Firebase
-      const docRef = await addDoc(collection(db, "schedules"), schedule);
-      console.log("Schedule created with ID: ", docRef.id);
-
-      // Redirect to schedules list
-      router.push("/schedules");
-      router.refresh();
+      const docRef = await addDoc(collection(db, "schedules"), scheduleData);
+      
+      setLoadingProgress(100);
+      setLoadingMessage("Schedule created successfully!");
+      
+      // Small delay to show completion
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      router.push(`/schedules/${docRef.id}`);
     } catch (error) {
       console.error("Error creating schedule:", error);
-      alert("An error occurred while creating the schedule.");
+      alert("Failed to create schedule. Please try again.");
     } finally {
       setIsSubmitting(false);
+      setLoadingProgress(0);
+      setLoadingMessage("");
     }
   };
 
-  if (loading) {
-    return <div className="text-center py-4">Loading employees...</div>;
-  }
+  // Helper function to count consecutive shifts
+  const getConsecutiveShifts = (shifts: ScheduleShift[], currentDate: string): number => {
+    const sortedShifts = [...shifts].sort((a, b) => 
+      new Date(a.date).getTime() - new Date(b.date).getTime()
+    );
+    
+    let consecutive = 0;
+    const currentDateObj = new Date(currentDate);
+    
+    for (let i = sortedShifts.length - 1; i >= 0; i--) {
+      const shiftDate = new Date(sortedShifts[i].date);
+      const diffDays = Math.floor(
+        (currentDateObj.getTime() - shiftDate.getTime()) / (1000 * 60 * 60 * 24)
+      );
+      
+      if (diffDays === consecutive + 1) {
+        consecutive++;
+      } else {
+        break;
+      }
+    }
+    
+    return consecutive;
+  };
 
   if (employees.length === 0) {
     return (
@@ -336,362 +456,406 @@ export default function ScheduleForm() {
   const availableDates = generateDateRange(startDate, endDate);
 
   return (
-    <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="md:col-span-2">
-          <label
-            htmlFor="name"
-            className="block text-sm font-medium text-[var(--foreground)]"
-          >
-            Schedule Name*
-          </label>
-          <input
-            id="name"
-            type="text"
-            {...register("name", { required: "Schedule name is required" })}
-            placeholder="e.g., May Schedule"
-            className={`mt-1 block w-full px-3 py-2 bg-[var(--highlight-bg)] border ${
-              errors.name
-                ? "border-[var(--accent-danger)]"
-                : "border-[var(--card-border)]"
-            } rounded-md shadow-sm focus:outline-none focus:ring-[var(--accent-primary)] focus:border-[var(--accent-primary)] text-[var(--foreground)]`}
-          />
-          {errors.name && (
-            <p className="mt-1 text-sm text-[var(--accent-danger)]">
-              {errors.name.message}
-            </p>
-          )}
-        </div>
-
-        <div>
-          <label
-            htmlFor="startDate"
-            className="block text-sm font-medium text-[var(--foreground)]"
-          >
-            Start Date*
-          </label>
-          <input
-            id="startDate"
-            type="date"
-            {...register("startDate", { required: "Start date is required" })}
-            className={`mt-1 block w-full px-3 py-2 bg-[var(--highlight-bg)] border ${
-              errors.startDate
-                ? "border-[var(--accent-danger)]"
-                : "border-[var(--card-border)]"
-            } rounded-md shadow-sm focus:outline-none focus:ring-[var(--accent-primary)] focus:border-[var(--accent-primary)] text-[var(--foreground)]`}
-          />
-          {errors.startDate && (
-            <p className="mt-1 text-sm text-[var(--accent-danger)]">
-              {errors.startDate.message}
-            </p>
-          )}
-        </div>
-
-        <div>
-          <label
-            htmlFor="endDate"
-            className="block text-sm font-medium text-[var(--foreground)]"
-          >
-            End Date*
-          </label>
-          <input
-            id="endDate"
-            type="date"
-            {...register("endDate", { required: "End date is required" })}
-            className={`mt-1 block w-full px-3 py-2 bg-[var(--highlight-bg)] border ${
-              errors.endDate
-                ? "border-[var(--accent-danger)]"
-                : "border-[var(--card-border)]"
-            } rounded-md shadow-sm focus:outline-none focus:ring-[var(--accent-primary)] focus:border-[var(--accent-primary)] text-[var(--foreground)]`}
-          />
-          {errors.endDate && (
-            <p className="mt-1 text-sm text-[var(--accent-danger)]">
-              {errors.endDate.message}
-            </p>
-          )}
-        </div>
-
-        <div className="md:col-span-2">
-          <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
-            Shift Type*
-          </label>
-          <div className="flex space-x-4">
-            <label className="inline-flex items-center">
-              <input
-                type="radio"
-                value="8hour"
-                {...register("shiftType", {
-                  required: "Shift type is required",
-                })}
-                className="h-4 w-4 text-[var(--accent-primary)] focus:ring-[var(--accent-primary)] border-[var(--card-border)]"
-              />
-              <span className="ml-2 text-sm text-[var(--foreground)]">
-                8 Hour Shifts (7am-3pm, 3pm-11pm, 11pm-7am)
-              </span>
+    <>
+      {isSubmitting && (
+        <LoadingProgress progress={loadingProgress} message={loadingMessage} />
+      )}
+      <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="md:col-span-2">
+            <label
+              htmlFor="name"
+              className="block text-sm font-medium text-[var(--foreground)]"
+            >
+              Schedule Name*
             </label>
-            <label className="inline-flex items-center">
-              <input
-                type="radio"
-                value="12hour"
-                {...register("shiftType", {
-                  required: "Shift type is required",
-                })}
-                className="h-4 w-4 text-[var(--accent-primary)] focus:ring-[var(--accent-primary)] border-[var(--card-border)]"
-              />
-              <span className="ml-2 text-sm text-[var(--foreground)]">
-                12 Hour Shifts (7am-7pm, 7pm-7am)
-              </span>
-            </label>
+            <input
+              id="name"
+              type="text"
+              {...register("name", { required: "Schedule name is required" })}
+              placeholder="e.g., May Schedule"
+              className={`mt-1 block w-full px-3 py-2 bg-[var(--highlight-bg)] border ${
+                errors.name
+                  ? "border-[var(--accent-danger)]"
+                  : "border-[var(--card-border)]"
+              } rounded-md shadow-sm focus:outline-none focus:ring-[var(--accent-primary)] focus:border-[var(--accent-primary)] text-[var(--foreground)]`}
+            />
+            {errors.name && (
+              <p className="mt-1 text-sm text-[var(--accent-danger)]">
+                {errors.name.message}
+              </p>
+            )}
           </div>
-          {errors.shiftType && (
-            <p className="mt-1 text-sm text-[var(--accent-danger)]">
-              {errors.shiftType.message}
-            </p>
-          )}
-        </div>
 
-        <div className="md:col-span-2">
-          <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
-            Select Employees*
-          </label>
-          <div className="border border-[var(--card-border)] bg-[var(--highlight-bg)] rounded-md p-4 max-h-80 overflow-y-auto">
-            {/* Nurses Section */}
-            <div className="mb-4">
-              <h3 className="text-sm font-semibold text-[var(--accent-primary)] mb-2">
-                Nurses
-              </h3>
-              {employees
-                .filter((emp) => emp.position.startsWith("Nurse"))
-                .map((employee) => (
-                  <div
-                    key={employee.id}
-                    className="flex items-center mb-2 last:mb-0 pl-2"
-                  >
+          <div>
+            <label
+              htmlFor="startDate"
+              className="block text-sm font-medium text-[var(--foreground)]"
+            >
+              Start Date*
+            </label>
+            <input
+              id="startDate"
+              type="date"
+              {...register("startDate", { required: "Start date is required" })}
+              className={`mt-1 block w-full px-3 py-2 bg-[var(--highlight-bg)] border ${
+                errors.startDate
+                  ? "border-[var(--accent-danger)]"
+                  : "border-[var(--card-border)]"
+              } rounded-md shadow-sm focus:outline-none focus:ring-[var(--accent-primary)] focus:border-[var(--accent-primary)] text-[var(--foreground)]`}
+            />
+            {errors.startDate && (
+              <p className="mt-1 text-sm text-[var(--accent-danger)]">
+                {errors.startDate.message}
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label
+              htmlFor="endDate"
+              className="block text-sm font-medium text-[var(--foreground)]"
+            >
+              End Date*
+            </label>
+            <input
+              id="endDate"
+              type="date"
+              {...register("endDate", { required: "End date is required" })}
+              className={`mt-1 block w-full px-3 py-2 bg-[var(--highlight-bg)] border ${
+                errors.endDate
+                  ? "border-[var(--accent-danger)]"
+                  : "border-[var(--card-border)]"
+              } rounded-md shadow-sm focus:outline-none focus:ring-[var(--accent-primary)] focus:border-[var(--accent-primary)] text-[var(--foreground)]`}
+            />
+            {errors.endDate && (
+              <p className="mt-1 text-sm text-[var(--accent-danger)]">
+                {errors.endDate.message}
+              </p>
+            )}
+          </div>
+
+          <div className="md:col-span-2">
+            <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
+              Shift Type*
+            </label>
+            <div className="flex space-x-4">
+              <label className="inline-flex items-center">
+                <input
+                  type="radio"
+                  value="8hour"
+                  {...register("shiftType", {
+                    required: "Shift type is required",
+                  })}
+                  className="h-4 w-4 text-[var(--accent-primary)] focus:ring-[var(--accent-primary)] border-[var(--card-border)]"
+                />
+                <span className="ml-2 text-sm text-[var(--foreground)]">
+                  8 Hour Shifts (7am-3pm, 3pm-11pm, 11pm-7am)
+                </span>
+              </label>
+              <label className="inline-flex items-center">
+                <input
+                  type="radio"
+                  value="12hour"
+                  {...register("shiftType", {
+                    required: "Shift type is required",
+                  })}
+                  className="h-4 w-4 text-[var(--accent-primary)] focus:ring-[var(--accent-primary)] border-[var(--card-border)]"
+                />
+                <span className="ml-2 text-sm text-[var(--foreground)]">
+                  12 Hour Shifts (7am-7pm, 7pm-7am)
+                </span>
+              </label>
+            </div>
+            {errors.shiftType && (
+              <p className="mt-1 text-sm text-[var(--accent-danger)]">
+                {errors.shiftType.message}
+              </p>
+            )}
+          </div>
+
+          <div className="md:col-span-2">
+            <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
+              Select Employees*
+            </label>
+            <div className="border border-[var(--card-border)] bg-[var(--highlight-bg)] rounded-md p-4 max-h-80 overflow-y-auto">
+              {/* Nurses Section */}
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-semibold text-[var(--accent-primary)]">
+                    Nurses
+                  </h3>
+                  <label className="inline-flex items-center">
                     <input
                       type="checkbox"
-                      id={`employee-${employee.id}`}
-                      value={employee.id}
-                      {...register("employees", {
-                        required: "At least one employee must be selected",
-                      })}
+                      checked={areAllSelected("Nurse")}
+                      onChange={() => handleSelectAll("Nurse")}
                       className="h-4 w-4 text-[var(--accent-primary)] focus:ring-[var(--accent-primary)] border-[var(--card-border)] rounded"
                     />
-                    <label
-                      htmlFor={`employee-${employee.id}`}
-                      className="ml-2 text-sm text-[var(--foreground)]"
+                    <span className="ml-2 text-sm text-[var(--foreground)]">
+                      Select All
+                    </span>
+                  </label>
+                </div>
+                {employees
+                  .filter((emp) => emp.position.startsWith("Nurse"))
+                  .map((employee) => (
+                    <div
+                      key={employee.id}
+                      className="flex items-center mb-2 last:mb-0 pl-2"
                     >
-                      {employee.firstName} {employee.lastName} -{" "}
-                      {employee.position}
-                      {isSeniorNurse(employee) && (
-                        <span className="ml-1 text-xs text-[var(--accent-primary)]">
-                          (Senior)
-                        </span>
-                      )}
-                    </label>
-                  </div>
-                ))}
-            </div>
+                      <input
+                        type="checkbox"
+                        id={`employee-${employee.id}`}
+                        value={employee.id}
+                        {...register("employees", {
+                          required: "At least one employee must be selected",
+                        })}
+                        className="h-4 w-4 text-[var(--accent-primary)] focus:ring-[var(--accent-primary)] border-[var(--card-border)] rounded"
+                      />
+                      <label
+                        htmlFor={`employee-${employee.id}`}
+                        className="ml-2 text-sm text-[var(--foreground)]"
+                      >
+                        {employee.firstName} {employee.lastName} -{" "}
+                        {employee.position}
+                        {isSeniorNurse(employee) && (
+                          <span className="ml-1 text-xs text-[var(--accent-primary)]">
+                            (Senior)
+                          </span>
+                        )}
+                      </label>
+                    </div>
+                  ))}
+              </div>
 
-            {/* Midwives Section */}
-            <div className="mb-4">
-              <h3 className="text-sm font-semibold text-[var(--accent-secondary)] mb-2">
-                Midwives
-              </h3>
-              {employees
-                .filter((emp) => emp.position.startsWith("Midwife"))
-                .map((employee) => (
-                  <div
-                    key={employee.id}
-                    className="flex items-center mb-2 last:mb-0 pl-2"
-                  >
+              {/* Midwives Section */}
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-semibold text-[var(--accent-secondary)]">
+                    Midwives
+                  </h3>
+                  <label className="inline-flex items-center">
                     <input
                       type="checkbox"
-                      id={`employee-${employee.id}`}
-                      value={employee.id}
-                      {...register("employees", {
-                        required: "At least one employee must be selected",
-                      })}
+                      checked={areAllSelected("Midwife")}
+                      onChange={() => handleSelectAll("Midwife")}
                       className="h-4 w-4 text-[var(--accent-secondary)] focus:ring-[var(--accent-secondary)] border-[var(--card-border)] rounded"
                     />
-                    <label
-                      htmlFor={`employee-${employee.id}`}
-                      className="ml-2 text-sm text-[var(--foreground)]"
+                    <span className="ml-2 text-sm text-[var(--foreground)]">
+                      Select All
+                    </span>
+                  </label>
+                </div>
+                {employees
+                  .filter((emp) => emp.position.startsWith("Midwife"))
+                  .map((employee) => (
+                    <div
+                      key={employee.id}
+                      className="flex items-center mb-2 last:mb-0 pl-2"
                     >
-                      {employee.firstName} {employee.lastName} -{" "}
-                      {employee.position}
-                    </label>
-                  </div>
-                ))}
-            </div>
+                      <input
+                        type="checkbox"
+                        id={`employee-${employee.id}`}
+                        value={employee.id}
+                        {...register("employees", {
+                          required: "At least one employee must be selected",
+                        })}
+                        className="h-4 w-4 text-[var(--accent-secondary)] focus:ring-[var(--accent-secondary)] border-[var(--card-border)] rounded"
+                      />
+                      <label
+                        htmlFor={`employee-${employee.id}`}
+                        className="ml-2 text-sm text-[var(--foreground)]"
+                      >
+                        {employee.firstName} {employee.lastName} -{" "}
+                        {employee.position}
+                      </label>
+                    </div>
+                  ))}
+              </div>
 
-            {/* Nursing Attendants Section */}
-            <div>
-              <h3 className="text-sm font-semibold text-[var(--accent-success)] mb-2">
-                Nursing Attendants
-              </h3>
-              {employees
-                .filter((emp) => emp.position.startsWith("NA"))
-                .map((employee) => (
-                  <div
-                    key={employee.id}
-                    className="flex items-center mb-2 last:mb-0 pl-2"
-                  >
+              {/* Nursing Attendants Section */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <h3 className="text-sm font-semibold text-[var(--accent-success)]">
+                    Nursing Attendants
+                  </h3>
+                  <label className="inline-flex items-center">
                     <input
                       type="checkbox"
-                      id={`employee-${employee.id}`}
-                      value={employee.id}
-                      {...register("employees", {
-                        required: "At least one employee must be selected",
-                      })}
+                      checked={areAllSelected("NA")}
+                      onChange={() => handleSelectAll("NA")}
                       className="h-4 w-4 text-[var(--accent-success)] focus:ring-[var(--accent-success)] border-[var(--card-border)] rounded"
                     />
-                    <label
-                      htmlFor={`employee-${employee.id}`}
-                      className="ml-2 text-sm text-[var(--foreground)]"
+                    <span className="ml-2 text-sm text-[var(--foreground)]">
+                      Select All
+                    </span>
+                  </label>
+                </div>
+                {employees
+                  .filter((emp) => emp.position.startsWith("NA"))
+                  .map((employee) => (
+                    <div
+                      key={employee.id}
+                      className="flex items-center mb-2 last:mb-0 pl-2"
                     >
-                      {employee.firstName} {employee.lastName} -{" "}
-                      {employee.position}
-                    </label>
-                  </div>
-                ))}
-            </div>
-          </div>
-          {errors.employees && (
-            <p className="mt-1 text-sm text-[var(--accent-danger)]">
-              {errors.employees.message}
-            </p>
-          )}
-        </div>
-
-        {/* Schedule Day Off Requests Section */}
-        <div className="md:col-span-2">
-          <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
-            Schedule Day Off Requests
-          </label>
-          <div className="border border-[var(--card-border)] bg-[var(--highlight-bg)] rounded-md p-4">
-            {/* Add Day Off Request Form */}
-            <div className="mb-4 p-4 bg-[var(--card-bg)] rounded-md">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-[var(--foreground)] mb-1">
-                    Select Employee
-                  </label>
-                  <select
-                    value={selectedEmployeeForDayOff?.id || ""}
-                    onChange={(e) => {
-                      const employee = employees.find(emp => emp.id === e.target.value);
-                      setSelectedEmployeeForDayOff(employee || null);
-                    }}
-                    className="w-full px-3 py-2 bg-[var(--highlight-bg)] border border-[var(--card-border)] rounded-md text-[var(--foreground)]"
-                  >
-                    <option value="">Select an employee</option>
-                    {employees
-                      .filter(emp => watch("employees").includes(emp.id))
-                      .map(emp => (
-                        <option key={emp.id} value={emp.id}>
-                          {emp.firstName} {emp.lastName}
-                        </option>
-                      ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-[var(--foreground)] mb-1">
-                    Select Date
-                  </label>
-                  <select
-                    value={selectedDate}
-                    onChange={(e) => setSelectedDate(e.target.value)}
-                    className="w-full px-3 py-2 bg-[var(--highlight-bg)] border border-[var(--card-border)] rounded-md text-[var(--foreground)]"
-                  >
-                    <option value="">Select a date</option>
-                    {availableDates.map(date => (
-                      <option key={date} value={date}>
-                        {new Date(date).toLocaleDateString('en-US', {
-                          weekday: 'short',
-                          month: 'short',
-                          day: 'numeric'
+                      <input
+                        type="checkbox"
+                        id={`employee-${employee.id}`}
+                        value={employee.id}
+                        {...register("employees", {
+                          required: "At least one employee must be selected",
                         })}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex items-end">
-                  <button
-                    type="button"
-                    onClick={addDayOffRequest}
-                    disabled={!selectedEmployeeForDayOff || !selectedDate}
-                    className="w-full px-4 py-2 bg-[var(--accent-primary)] text-white rounded-md hover:bg-[color-mix(in_srgb,var(--accent-primary),black_10%)] disabled:opacity-50"
-                  >
-                    Add Day Off
-                  </button>
-                </div>
+                        className="h-4 w-4 text-[var(--accent-success)] focus:ring-[var(--accent-success)] border-[var(--card-border)] rounded"
+                      />
+                      <label
+                        htmlFor={`employee-${employee.id}`}
+                        className="ml-2 text-sm text-[var(--foreground)]"
+                      >
+                        {employee.firstName} {employee.lastName} -{" "}
+                        {employee.position}
+                      </label>
+                    </div>
+                  ))}
               </div>
             </div>
+            {errors.employees && (
+              <p className="mt-1 text-sm text-[var(--accent-danger)]">
+                {errors.employees.message}
+              </p>
+            )}
+          </div>
 
-            {/* Display Day Off Requests */}
-            <div className="space-y-4">
-              {Object.entries(scheduleDayOffRequests).map(([employeeId, dates]) => {
-                const employee = employees.find(emp => emp.id === employeeId);
-                if (!employee) return null;
-
-                return (
-                  <div key={employeeId} className="p-3 bg-[var(--card-bg)] rounded-md">
-                    <div className="flex justify-between items-center mb-2">
-                      <h4 className="font-medium text-[var(--foreground)]">
-                        {employee.firstName} {employee.lastName}
-                      </h4>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      {dates.map(date => (
-                        <div
-                          key={date}
-                          className="flex items-center gap-1 px-2 py-1 bg-[var(--highlight-bg)] rounded-md text-sm"
-                        >
-                          <span className="text-[var(--foreground)]">
-                            {new Date(date).toLocaleDateString('en-US', {
-                              weekday: 'short',
-                              month: 'short',
-                              day: 'numeric'
-                            })}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => removeDayOffRequest(employeeId, date)}
-                            className="text-[var(--accent-danger)] hover:text-[color-mix(in_srgb,var(--accent-danger),black_10%)]"
-                          >
-                            <XMarkIcon className="w-4 h-4" />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
+          {/* Schedule Day Off Requests Section */}
+          <div className="md:col-span-2">
+            <label className="block text-sm font-medium text-[var(--foreground)] mb-2">
+              Schedule Day Off Requests
+            </label>
+            <div className="border border-[var(--card-border)] bg-[var(--highlight-bg)] rounded-md p-4">
+              {/* Add Day Off Request Form */}
+              <div className="mb-4 p-4 bg-[var(--card-bg)] rounded-md">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-[var(--foreground)] mb-1">
+                      Select Employee
+                    </label>
+                    <select
+                      value={selectedEmployeeForDayOff?.id || ""}
+                      onChange={(e) => {
+                        const employee = employees.find(emp => emp.id === e.target.value);
+                        setSelectedEmployeeForDayOff(employee || null);
+                      }}
+                      className="w-full px-3 py-2 bg-[var(--highlight-bg)] border border-[var(--card-border)] rounded-md text-[var(--foreground)]"
+                    >
+                      <option value="">Select an employee</option>
+                      {employees
+                        .filter(emp => watch("employees").includes(emp.id))
+                        .map(emp => (
+                          <option key={emp.id} value={emp.id}>
+                            {emp.firstName} {emp.lastName}
+                          </option>
+                        ))}
+                    </select>
                   </div>
-                );
-              })}
-              {Object.keys(scheduleDayOffRequests).length === 0 && (
-                <p className="text-sm text-[var(--muted-text)] text-center py-4">
-                  No day off requests added yet. Select an employee and date above to add one.
-                </p>
-              )}
+                  <div>
+                    <label className="block text-sm font-medium text-[var(--foreground)] mb-1">
+                      Select Date
+                    </label>
+                    <select
+                      value={selectedDate}
+                      onChange={(e) => setSelectedDate(e.target.value)}
+                      className="w-full px-3 py-2 bg-[var(--highlight-bg)] border border-[var(--card-border)] rounded-md text-[var(--foreground)]"
+                    >
+                      <option value="">Select a date</option>
+                      {availableDates.map(date => (
+                        <option key={date} value={date}>
+                          {new Date(date).toLocaleDateString('en-US', {
+                            weekday: 'short',
+                            month: 'short',
+                            day: 'numeric'
+                          })}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex items-end">
+                    <button
+                      type="button"
+                      onClick={addDayOffRequest}
+                      disabled={!selectedEmployeeForDayOff || !selectedDate}
+                      className="w-full px-4 py-2 bg-[var(--accent-primary)] text-white rounded-md hover:bg-[color-mix(in_srgb,var(--accent-primary),black_10%)] disabled:opacity-50"
+                    >
+                      Add Day Off
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Display Day Off Requests */}
+              <div className="space-y-4">
+                {Object.entries(scheduleDayOffRequests).map(([employeeId, dates]) => {
+                  const employee = employees.find(emp => emp.id === employeeId);
+                  if (!employee) return null;
+
+                  return (
+                    <div key={employeeId} className="p-3 bg-[var(--card-bg)] rounded-md">
+                      <div className="flex justify-between items-center mb-2">
+                        <h4 className="font-medium text-[var(--foreground)]">
+                          {employee.firstName} {employee.lastName}
+                        </h4>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {dates.map(date => (
+                          <div
+                            key={date}
+                            className="flex items-center gap-1 px-2 py-1 bg-[var(--highlight-bg)] rounded-md text-sm"
+                          >
+                            <span className="text-[var(--foreground)]">
+                              {new Date(date).toLocaleDateString('en-US', {
+                                weekday: 'short',
+                                month: 'short',
+                                day: 'numeric'
+                              })}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => removeDayOffRequest(employeeId, date)}
+                              className="text-[var(--accent-danger)] hover:text-[color-mix(in_srgb,var(--accent-danger),black_10%)]"
+                            >
+                              <XMarkIcon className="w-4 h-4" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+                {Object.keys(scheduleDayOffRequests).length === 0 && (
+                  <p className="text-sm text-[var(--muted-text)] text-center py-4">
+                    No day off requests added yet. Select an employee and date above to add one.
+                  </p>
+                )}
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <div className="flex justify-end space-x-3">
-        <Link
-          href="/schedules"
-          className="px-4 py-2 border border-[var(--card-border)] rounded-md shadow-sm text-sm font-medium text-[var(--foreground)] bg-[var(--highlight-bg)] hover:bg-[color-mix(in_srgb,var(--highlight-bg),black_10%)] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[var(--accent-primary)]"
-        >
-          Cancel
-        </Link>
-        <button
-          type="submit"
-          disabled={isSubmitting}
-          className="inline-flex justify-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-[var(--accent-success)] hover:bg-[color-mix(in_srgb,var(--accent-success),black_10%)] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[var(--accent-success)] disabled:opacity-50"
-        >
-          {isSubmitting ? "Creating..." : "Create Schedule"}
-        </button>
-      </div>
-    </form>
+        <div className="flex justify-end space-x-3">
+          <Link
+            href="/schedules"
+            className="px-4 py-2 border border-[var(--card-border)] rounded-md shadow-sm text-sm font-medium text-[var(--foreground)] bg-[var(--highlight-bg)] hover:bg-[color-mix(in_srgb,var(--highlight-bg),black_10%)] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[var(--accent-primary)]"
+          >
+            Cancel
+          </Link>
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="inline-flex justify-center px-4 py-2 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-[var(--accent-success)] hover:bg-[color-mix(in_srgb,var(--accent-success),black_10%)] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[var(--accent-success)] disabled:opacity-50"
+          >
+            {isSubmitting ? "Creating..." : "Create Schedule"}
+          </button>
+        </div>
+      </form>
+    </>
   );
 }

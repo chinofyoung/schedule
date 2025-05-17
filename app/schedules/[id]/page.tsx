@@ -9,10 +9,13 @@ import {
   query,
   where,
   getDocs,
+  deleteDoc,
 } from "firebase/firestore";
 import Link from "next/link";
 import { Employee, ScheduleShift } from "../../../types/employee";
 import { useParams, useRouter } from "next/navigation";
+import * as XLSX from 'xlsx';
+import { ArrowDownTrayIcon, TrashIcon } from "@heroicons/react/24/outline";
 
 interface Schedule {
   id: string;
@@ -33,6 +36,7 @@ export default function ScheduleDetails() {
   const [schedule, setSchedule] = useState<Schedule | null>(null);
   const [employees, setEmployees] = useState<Record<string, Employee>>({});
   const [loading, setLoading] = useState(true);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   // Calculate total hours for an employee
   const calculateEmployeeHours = (employeeId: string): number => {
@@ -134,6 +138,156 @@ export default function ScheduleDetails() {
     });
   };
 
+  // Export schedule to XLSX
+  const exportToExcel = () => {
+    if (!schedule || !employees) return;
+
+    // Create workbook and worksheet
+    const wb = XLSX.utils.book_new();
+    
+    // Prepare data for the main schedule sheet
+    const scheduleData = [
+      ['Schedule Details'],
+      ['Name:', schedule.name],
+      ['Date Range:', `${formatDate(schedule.startDate)} - ${formatDate(schedule.endDate)}`],
+      ['Shift Type:', schedule.shiftType === "8hour" ? "8 Hour Shifts" : "12 Hour Shifts"],
+      [''],
+      ['Schedule Calendar']
+    ];
+
+    // Add shifts by date
+    const shiftsByDate = getShiftsByDate();
+    const sortedDates = Object.keys(shiftsByDate).sort();
+
+    sortedDates.forEach(date => {
+      scheduleData.push([formatDate(date)]);
+      
+      if (schedule.shiftType === "8hour") {
+        scheduleData.push(['Morning (7am - 3pm)']);
+        shiftsByDate[date]
+          .filter(s => s.shiftName === "morning")
+          .forEach(shift => {
+            const employee = employees[shift.employeeId];
+            if (employee) {
+              scheduleData.push([
+                `${employee.firstName} ${employee.lastName}`,
+                employee.position,
+                shift.isPointPerson ? 'Point Person' : ''
+              ]);
+            }
+          });
+
+        scheduleData.push(['Afternoon (3pm - 11pm)']);
+        shiftsByDate[date]
+          .filter(s => s.shiftName === "afternoon")
+          .forEach(shift => {
+            const employee = employees[shift.employeeId];
+            if (employee) {
+              scheduleData.push([
+                `${employee.firstName} ${employee.lastName}`,
+                employee.position,
+                shift.isPointPerson ? 'Point Person' : ''
+              ]);
+            }
+          });
+
+        scheduleData.push(['Night (11pm - 7am)']);
+        shiftsByDate[date]
+          .filter(s => s.shiftName === "night")
+          .forEach(shift => {
+            const employee = employees[shift.employeeId];
+            if (employee) {
+              scheduleData.push([
+                `${employee.firstName} ${employee.lastName}`,
+                employee.position,
+                shift.isPointPerson ? 'Point Person' : ''
+              ]);
+            }
+          });
+      } else {
+        scheduleData.push(['Day (7am - 7pm)']);
+        shiftsByDate[date]
+          .filter(s => s.shiftName === "day")
+          .forEach(shift => {
+            const employee = employees[shift.employeeId];
+            if (employee) {
+              scheduleData.push([
+                `${employee.firstName} ${employee.lastName}`,
+                employee.position,
+                shift.isPointPerson ? 'Point Person' : ''
+              ]);
+            }
+          });
+
+        scheduleData.push(['Night (7pm - 7am)']);
+        shiftsByDate[date]
+          .filter(s => s.shiftName === "night")
+          .forEach(shift => {
+            const employee = employees[shift.employeeId];
+            if (employee) {
+              scheduleData.push([
+                `${employee.firstName} ${employee.lastName}`,
+                employee.position,
+                shift.isPointPerson ? 'Point Person' : ''
+              ]);
+            }
+          });
+      }
+      scheduleData.push(['']); // Add empty row between dates
+    });
+
+    // Add employee summary sheet
+    const employeeData = [
+      ['Employee Summary'],
+      ['Name', 'Position', 'Total Hours', 'Day Off Requests']
+    ];
+
+    Object.entries(employees).forEach(([employeeId, employee]) => {
+      const totalHours = calculateEmployeeHours(employeeId);
+      const dayOffRequests = getEmployeeDayOffRequests(employeeId);
+      
+      employeeData.push([
+        `${employee.firstName} ${employee.lastName}`,
+        employee.position,
+        totalHours.toString(),
+        dayOffRequests.map(date => formatDate(date)).join(', ')
+      ]);
+    });
+
+    // Create worksheets
+    const wsSchedule = XLSX.utils.aoa_to_sheet(scheduleData);
+    const wsEmployees = XLSX.utils.aoa_to_sheet(employeeData);
+
+    // Add worksheets to workbook
+    XLSX.utils.book_append_sheet(wb, wsSchedule, 'Schedule');
+    XLSX.utils.book_append_sheet(wb, wsEmployees, 'Employee Summary');
+
+    // Generate Excel file
+    XLSX.writeFile(wb, `${schedule.name.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_schedule.xlsx`);
+  };
+
+  // Delete schedule
+  const handleDelete = async () => {
+    if (!schedule) return;
+
+    if (!confirm(`Are you sure you want to delete the schedule "${schedule.name}"? This action cannot be undone.`)) {
+      return;
+    }
+
+    try {
+      setIsDeleting(true);
+      const scheduleRef = doc(db, "schedules", scheduleId);
+      await deleteDoc(scheduleRef);
+      router.push("/schedules");
+      router.refresh();
+    } catch (error) {
+      console.error("Error deleting schedule:", error);
+      alert("An error occurred while deleting the schedule.");
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
   if (loading) {
     return <div className="text-center py-10">Loading schedule...</div>;
   }
@@ -161,12 +315,29 @@ export default function ScheduleDetails() {
         <h1 className="text-2xl font-bold text-[var(--foreground)]">
           {schedule.name}
         </h1>
-        <Link
-          href="/schedules"
-          className="px-4 py-2 bg-[var(--highlight-bg)] text-[var(--foreground)] rounded border border-[var(--card-border)] hover:bg-[color-mix(in_srgb,var(--highlight-bg),black_10%)]"
-        >
-          Back to Schedules
-        </Link>
+        <div className="flex gap-3">
+          <button
+            onClick={exportToExcel}
+            className="px-4 py-2 bg-[var(--accent-success)] text-white rounded border border-[var(--card-border)] hover:bg-[color-mix(in_srgb,var(--accent-success),black_10%)] flex items-center gap-2"
+          >
+            <ArrowDownTrayIcon className="w-5 h-5" />
+            Export to Excel
+          </button>
+          <button
+            onClick={handleDelete}
+            disabled={isDeleting}
+            className="px-4 py-2 bg-[var(--accent-danger)] text-white rounded border border-[var(--card-border)] hover:bg-[color-mix(in_srgb,var(--accent-danger),black_10%)] flex items-center gap-2 disabled:opacity-50"
+          >
+            <TrashIcon className="w-5 h-5" />
+            {isDeleting ? "Deleting..." : "Delete Schedule"}
+          </button>
+          <Link
+            href="/schedules"
+            className="px-4 py-2 bg-[var(--highlight-bg)] text-[var(--foreground)] rounded border border-[var(--card-border)] hover:bg-[color-mix(in_srgb,var(--highlight-bg),black_10%)]"
+          >
+            Back to Schedules
+          </Link>
+        </div>
       </div>
 
       <div className="bg-[var(--card-bg)] rounded-lg border border-[var(--card-border)] p-4 mb-6">
@@ -260,65 +431,58 @@ export default function ScheduleDetails() {
         </div>
       </div>
 
-      {/* Employee Summary Section */}
+      {/* Employee Summary */}
       <div className="mt-8">
-        <h2 className="text-xl font-semibold mb-4 text-[var(--foreground)]">
+        <h2 className="text-xl font-semibold text-[var(--foreground)] mb-4">
           Employee Summary
         </h2>
-        <div className="bg-[var(--card-bg)] rounded-lg border border-[var(--card-border)] p-4">
-          <div className="space-y-4">
-            {Object.entries(employees).map(([employeeId, employee]) => {
-              const totalHours = calculateEmployeeHours(employeeId);
-              const dayOffRequests = getEmployeeDayOffRequests(employeeId);
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {Object.entries(employees).map(([employeeId, employee]) => {
+            const totalHours = calculateEmployeeHours(employeeId);
+            const dayOffRequests = getEmployeeDayOffRequests(employeeId);
 
-              return (
-                <div
-                  key={employeeId}
-                  className="p-4 bg-[var(--highlight-bg)] rounded-md"
-                >
-                  <div className="flex justify-between items-start mb-2">
-                    <div>
-                      <h3 className="font-medium text-[var(--foreground)]">
-                        {employee.firstName} {employee.lastName}
-                      </h3>
-                      <p className="text-sm text-[var(--muted-text)]">
-                        {employee.position}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      <p className="font-medium text-[var(--foreground)]">
-                        {totalHours} hours
-                      </p>
-                      <p className="text-sm text-[var(--muted-text)]">
-                        {schedule.shiftType === "8hour" ? "8-hour shifts" : "12-hour shifts"}
-                      </p>
+            return (
+              <div
+                key={employeeId}
+                className="bg-[var(--card-bg)] rounded-lg p-4 border border-[var(--card-border)]"
+              >
+                <div className="flex justify-between items-start mb-2">
+                  <div>
+                    <h3 className="font-medium text-[var(--foreground)]">
+                      {employee.firstName} {employee.lastName}
+                    </h3>
+                    <p className="text-sm text-[var(--muted-text)]">
+                      {employee.position}
+                    </p>
+                  </div>
+                  <span className="text-sm font-medium text-[var(--accent-primary)]">
+                    {totalHours} hours
+                  </span>
+                </div>
+                {dayOffRequests.length > 0 && (
+                  <div className="mt-2">
+                    <p className="text-sm text-[var(--muted-text)] mb-1">
+                      Day Off Requests:
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {dayOffRequests.map((date) => (
+                        <span
+                          key={date}
+                          className="inline-block px-2 py-1 bg-[var(--highlight-bg)] rounded text-xs text-[var(--foreground)]"
+                        >
+                          {new Date(date).toLocaleDateString("en-US", {
+                            weekday: "short",
+                            month: "short",
+                            day: "numeric",
+                          })}
+                        </span>
+                      ))}
                     </div>
                   </div>
-                  {dayOffRequests.length > 0 && (
-                    <div className="mt-2">
-                      <p className="text-sm font-medium text-[var(--foreground)] mb-1">
-                        Day Off Requests:
-                      </p>
-                      <div className="flex flex-wrap gap-2">
-                        {dayOffRequests.map(date => (
-                          <div
-                            key={date}
-                            className="px-2 py-1 bg-[var(--card-bg)] rounded-md text-sm text-[var(--foreground)]"
-                          >
-                            {new Date(date).toLocaleDateString('en-US', {
-                              weekday: 'short',
-                              month: 'short',
-                              day: 'numeric'
-                            })}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>
